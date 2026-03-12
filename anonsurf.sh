@@ -3,10 +3,6 @@ set -euo pipefail
 
 APP_NAME="anonsurf-lite"
 STATE_DIR="/var/lib/${APP_NAME}"
-IPTABLES_BAK="${STATE_DIR}/iptables.rules"
-IP6TABLES_BAK="${STATE_DIR}/ip6tables.rules"
-RESOLV_BAK="${STATE_DIR}/resolv.conf"
-RESOLV_LINK_BAK="${STATE_DIR}/resolv.conf.link"
 TORRC="/etc/tor/torrc"
 TORRC_BAK="${STATE_DIR}/torrc.bak"
 TOR_WAS_ACTIVE="${STATE_DIR}/tor.was.active"
@@ -27,7 +23,6 @@ TOR_NEW_CIRCUIT_PERIOD=""
 TOR_MAX_DIRTINESS=""
 AUTO_EXIT=0
 FORCE_OS=0
-FORCE_NFT=0
 
 COLOR=${COLOR:-1}
 if [ "$COLOR" -eq 1 ]; then
@@ -55,18 +50,11 @@ err() { say "$C_RED" "[ERR] $1"; }
 die() { printf "error: %s\n" "$*" >&2; exit 1; }
 
 has_tor_nat_rules() {
-  iptables -t nat -S 2>/dev/null | grep -Eq 'REDIRECT.*(9040|9053)'
+  nft list table inet anonsurf >/dev/null 2>&1
 }
 
 has_tor_filter_rules() {
-  local tuser tuid
-  tuser="$(tor_user)"
-  tuid="$(id -u "$tuser" 2>/dev/null || true)"
-  if [ -n "$tuid" ]; then
-    iptables -S 2>/dev/null | grep -Eq "uid-owner ${tuid}"
-  else
-    iptables -S 2>/dev/null | grep -Eq 'uid-owner .*tor|uid-owner .*debian-tor'
-  fi
+  has_tor_nat_rules
 }
 
 verify_tor_connectivity() {
@@ -105,20 +93,9 @@ is_supported_os() {
   return 1
 }
 
-check_iptables_backend() {
-  if iptables -V 2>/dev/null | grep -q 'nf_tables'; then
-    if [ "$FORCE_NFT" -eq 1 ]; then
-      warn "iptables-nft detected; continuing by request"
-      return 0
-    fi
-    die "iptables-nft detected; use --force-nft to continue (may be unstable)"
-  fi
-}
-
 preflight() {
-  need_cmd iptables
-  need_cmd iptables-save
-  need_cmd iptables-restore
+  need_cmd nft
+  need_cmd resolvectl
   need_cmd systemctl
   if ! is_supported_os; then
     if [ "$FORCE_OS" -eq 1 ]; then
@@ -127,7 +104,6 @@ preflight() {
       die "unsupported OS (intended for Pop!/Ubuntu). Use --force-os to continue."
     fi
   fi
-  check_iptables_backend
   tor_user >/dev/null 2>&1 || die "tor user not found (install tor first)"
 }
 
@@ -156,37 +132,33 @@ ensure_state_dir() {
   chmod 700 "$STATE_DIR"
 }
 
+get_default_interface() {
+  ip route show default | awk '/default/ {print $5}' | head -n 1
+}
+
 backup_resolv_conf() {
-  if [ ! -e "$RESOLV_BAK" ]; then
-    cp -a /etc/resolv.conf "$RESOLV_BAK"
-    if [ -L /etc/resolv.conf ]; then
-      readlink -f /etc/resolv.conf > "$RESOLV_LINK_BAK" || true
-    fi
-  fi
-  if systemctl is-active --quiet systemd-resolved; then
-    # Keep systemd-resolved's stub; DNS will be redirected to Tor by iptables.
+  # We use resolvectl now, no need to backup resolv.conf
+  local iface
+  iface="$(get_default_interface)"
+  if [ -z "$iface" ]; then
+    warn "could not detect default interface for DNS routing"
     return 0
   fi
-  printf "nameserver 127.0.0.1\n" > /etc/resolv.conf
-  chmod 644 /etc/resolv.conf
+  # Redirect DNS for the primary interface to Tor's DNS port
+  resolvectl dns "$iface" 127.0.0.1
+  resolvectl domain "$iface" "~."
 }
 
 restore_resolv_conf() {
-  if systemctl is-active --quiet systemd-resolved; then
-    ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
-    return
+  local iface
+  iface="$(get_default_interface)"
+  if [ -z "$iface" ]; then
+    return 0
   fi
-  if [ -s "$RESOLV_LINK_BAK" ]; then
-    local target
-    target="$(cat "$RESOLV_LINK_BAK" 2>/dev/null || true)"
-    if [ -n "$target" ]; then
-      ln -sf "$target" /etc/resolv.conf
-      return
-    fi
-  fi
-  if [ -e "$RESOLV_BAK" ]; then
-    cp -a "$RESOLV_BAK" /etc/resolv.conf
-  fi
+  # Revert to automatic DNS (usually provided by DHCP via NetworkManager)
+  resolvectl revert "$iface" >/dev/null 2>&1 || true
+  # Flush DNS cache by restarting systemd-resolved
+  systemctl restart systemd-resolved >/dev/null 2>&1 || true
 }
 
 ensure_torrc() {
@@ -235,80 +207,66 @@ strip_torrc_block() {
 }
 
 clear_state() {
-  rm -f "$IPTABLES_BAK" "$IP6TABLES_BAK" "$RESOLV_BAK" "$RESOLV_LINK_BAK" "$TORRC_BAK" "$TOR_WAS_ACTIVE"
-}
-
-save_iptables() {
-  iptables-save > "$IPTABLES_BAK"
-  if command -v ip6tables-save >/dev/null 2>&1; then
-    ip6tables-save > "$IP6TABLES_BAK" || true
-  fi
+  rm -f "$TORRC_BAK" "$TOR_WAS_ACTIVE"
 }
 
 apply_iptables() {
-  local tor_uid
-  tor_uid="$(tor_user)"
+  local tuid
+  tuid="$(id -u "$(tor_user)")"
+  
+  # Clean old rules if they exist
+  nft delete table inet anonsurf >/dev/null 2>&1 || true
 
-  iptables -F
-  iptables -t nat -F
-  iptables -t nat -X
-  iptables -X
+  nft -f - << EOF2
+table inet anonsurf {
+    chain output_nat {
+        type nat hook output priority filter; policy accept;
 
-  iptables -P INPUT ACCEPT
-  iptables -P FORWARD ACCEPT
-  iptables -P OUTPUT ACCEPT
+        # Redirect DNS
+        udp dport 53 redirect to :$TOR_DNS_PORT
+        tcp dport 53 redirect to :$TOR_DNS_PORT
 
-  iptables -A INPUT -i lo -j ACCEPT
-  iptables -A OUTPUT -o lo -j ACCEPT
+        # Redirect Virtual Addresses (onion routed)
+        ip daddr $TOR_VADDR tcp dport != 53 redirect to :$TOR_TRANS_PORT
+        ip daddr $TOR_VADDR udp dport != 53 redirect to :$TOR_TRANS_PORT
 
-  iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-  iptables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+        # Accept traffic from tor itself
+        meta skuid $tuid accept
 
-  # Allow DHCP (needed for lease renewals)
-  iptables -A OUTPUT -p udp --sport 68 --dport 67 -j ACCEPT
-  iptables -A INPUT -p udp --sport 67 --dport 68 -j ACCEPT
+        # Exclude local networks
+        ip daddr { 127.0.0.0/8, 127.128.0.0/10, 192.168.0.0/16, 172.16.0.0/12, 10.0.0.0/8 } accept
 
-  iptables -A OUTPUT -m owner --uid-owner "$tor_uid" -j ACCEPT
+        # Redirect all other TCP to TransPort
+        meta l4proto tcp redirect to :$TOR_TRANS_PORT
+    }
 
-  iptables -t nat -A OUTPUT -m owner --uid-owner "$tor_uid" -j RETURN
-  iptables -t nat -A OUTPUT -p udp --dport 53 -j REDIRECT --to-ports "$TOR_DNS_PORT"
-  iptables -t nat -A OUTPUT -p tcp --dport 53 -j REDIRECT --to-ports "$TOR_DNS_PORT"
-  iptables -t nat -A OUTPUT -p tcp -d "$TOR_VADDR" -j REDIRECT --to-ports "$TOR_TRANS_PORT"
-  iptables -t nat -A OUTPUT -p udp -d "$TOR_VADDR" -j REDIRECT --to-ports "$TOR_TRANS_PORT"
+    chain output_filter {
+        type filter hook output priority filter; policy accept;
 
-  for NET in $TOR_EXCLUDE 127.0.0.0/8 127.128.0.0/10; do
-    iptables -t nat -A OUTPUT -d "$NET" -j RETURN
-  done
+        # Allow loopback
+        oifname "lo" accept
 
-  iptables -t nat -A OUTPUT -p tcp --syn -j REDIRECT --to-ports "$TOR_TRANS_PORT"
+        # Allow established
+        ct state established,related accept
 
-  for NET in $TOR_EXCLUDE 127.0.0.0/8; do
-    iptables -A OUTPUT -d "$NET" -j ACCEPT
-  done
+        # Allow DHCP
+        udp sport 68 udp dport 67 accept
 
-  iptables -A OUTPUT -j REJECT --reject-with icmp-port-unreachable
+        # Allow tor user
+        meta skuid $tuid accept
 
-  if command -v ip6tables >/dev/null 2>&1; then
-    ip6tables -F || true
-    ip6tables -X || true
-    ip6tables -P INPUT ACCEPT || true
-    ip6tables -P FORWARD ACCEPT || true
-    ip6tables -P OUTPUT ACCEPT || true
-    ip6tables -A INPUT -i lo -j ACCEPT || true
-    ip6tables -A OUTPUT -o lo -j ACCEPT || true
-    ip6tables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT || true
-    ip6tables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT || true
-    ip6tables -A OUTPUT -j REJECT --reject-with icmp6-adm-prohibited || true
-  fi
+        # Allow local networks
+        ip daddr { 127.0.0.0/8, 192.168.0.0/16, 172.16.0.0/12, 10.0.0.0/8 } accept
+
+        # Block all other (non-TCP, non-DNS) traffic e.g UDP leaks
+        meta l4proto udp udp dport != 53 reject with icmp type port-unreachable
+    }
+}
+EOF2
 }
 
 restore_iptables() {
-  if [ -e "$IPTABLES_BAK" ]; then
-    iptables-restore < "$IPTABLES_BAK"
-  fi
-  if [ -e "$IP6TABLES_BAK" ] && command -v ip6tables-restore >/dev/null 2>&1; then
-    ip6tables-restore < "$IP6TABLES_BAK" || true
-  fi
+  nft delete table inet anonsurf >/dev/null 2>&1 || true
 }
 
 tor_start() {
@@ -399,22 +357,11 @@ status() {
   else
     warn "tor: inactive (${TOR_UNIT})"
   fi
-  if [ -e "$IPTABLES_BAK" ]; then
-    ok "iptables backup: present"
-  else
-    warn "iptables backup: missing"
-  fi
 
   if has_tor_nat_rules; then
-    ok "tor NAT rules: present"
+    ok "tor nftables rules: present"
   else
-    warn "tor NAT rules: missing"
-  fi
-
-  if has_tor_filter_rules; then
-    ok "tor filter rules: present"
-  else
-    warn "tor filter rules: missing"
+    warn "tor nftables rules: missing"
   fi
 
   if command -v ss >/dev/null 2>&1; then
@@ -448,8 +395,8 @@ status() {
       if [ "$direct_ip" = "$tor_ip" ]; then
         warn "Tor not enforced (direct == Tor IP)"
       else
-        if has_tor_nat_rules && has_tor_filter_rules; then
-          ok "system appears torified (iptables enforced)"
+        if has_tor_nat_rules; then
+          ok "system appears torified (nftables enforced)"
         else
           warn "Tor reachable via torsocks only (system not torified)"
         fi
@@ -461,11 +408,6 @@ status() {
 doctor() {
   section "Doctor"
   status
-  if [ -L /etc/resolv.conf ]; then
-    ok "resolv.conf is symlink: $(readlink -f /etc/resolv.conf)"
-  else
-    warn "resolv.conf is not a symlink"
-  fi
   if systemctl is-active --quiet systemd-resolved; then
     ok "systemd-resolved: active"
   else
@@ -481,7 +423,6 @@ doctor() {
 start() {
   need_root
   section "Starting ${APP_NAME}"
-  # If this fails, it’s not personal. Tor just ghosted your packets.
   preflight
   ensure_state_dir
   record_tor_state
@@ -504,19 +445,17 @@ start() {
     fi
   fi
   backup_resolv_conf
-  save_iptables
   apply_iptables
 
   rollback=0
   trap - ERR
-  ok "tor routing enabled"
+  ok "tor routing enabled via nftables"
   status
 }
 
 stop() {
   need_root
   section "Stopping ${APP_NAME}"
-  # Returning your network to normal, begrudgingly.
   restore_iptables
   restore_resolv_conf
   restore_torrc
@@ -527,9 +466,7 @@ stop() {
   else
     tor_stop_if_needed
   fi
-  systemctl restart NetworkManager >/dev/null 2>&1 || true
-  systemctl restart systemd-resolved >/dev/null 2>&1 || true
-  if has_tor_nat_rules || has_tor_filter_rules; then
+  if has_tor_nat_rules; then
     warn "Tor rules still present after restore; applying panic fallback"
     panic
   else
@@ -541,7 +478,7 @@ stop() {
 reset() {
   need_root
   section "Resetting Tor identity"
-  # Because nothing says “fresh start” like asking Tor nicely.
+  
   if tor_newnym; then
     ok "tor identity refreshed"
   else
@@ -554,28 +491,14 @@ reset() {
 panic() {
   need_root
   section "Panic: Unblock network"
-  iptables -F || true
-  iptables -t nat -F || true
-  iptables -t mangle -F || true
-  iptables -X || true
-  iptables -P INPUT ACCEPT || true
-  iptables -P FORWARD ACCEPT || true
-  iptables -P OUTPUT ACCEPT || true
-  if command -v ip6tables >/dev/null 2>&1; then
-    ip6tables -F || true
-    ip6tables -X || true
-    ip6tables -P INPUT ACCEPT || true
-    ip6tables -P FORWARD ACCEPT || true
-    ip6tables -P OUTPUT ACCEPT || true
-  fi
+  nft delete table inet anonsurf >/dev/null 2>&1 || true
   restore_resolv_conf
-  systemctl restart NetworkManager >/dev/null 2>&1 || true
-  systemctl restart systemd-resolved >/dev/null 2>&1 || true
-  ok "network unblocked (panic)"
+  # No longer restarting NM during panic!
+  ok "network unblocked (panic) - nftables cleared"
 }
 
 usage() {
-  cat <<EOF
+  cat <<EOF2
 Usage: $0 start|stop|reset|status|panic
   start  - route all TCP/DNS through Tor (blocks other traffic)
   stop   - restore network settings
@@ -592,9 +515,8 @@ Options:
   --exit=CC,CC (with start) prefer exit countries, e.g. --exit=US,DE
   --strict (with start) require exit nodes to match --exit
   --force-os (with start) run on non-Ubuntu/Pop distros
-  --force-nft (with start) allow iptables-nft backend
   COLOR=0 disable colored output
-EOF
+EOF2
 }
 
 parse_start_args() {
@@ -624,7 +546,6 @@ parse_start_args() {
         ;;
       --strict) TOR_STRICT_NODES=1 ;;
       --force-os) FORCE_OS=1 ;;
-      --force-nft) FORCE_NFT=1 ;;
       *) ;;
     esac
     shift
