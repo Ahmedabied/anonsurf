@@ -31,6 +31,9 @@ if [ "$COLOR" -eq 1 ]; then
   C_YELLOW='\033[1;33m'
   C_BLUE='\033[1;34m'
   C_CYAN='\033[1;36m'
+  C_MAGENTA='\033[1;35m'
+  C_WHITE='\033[1;37m'
+  C_BOLD='\033[1m'
   C_RESET='\033[0m'
 else
   C_RED=''
@@ -38,16 +41,46 @@ else
   C_YELLOW=''
   C_BLUE=''
   C_CYAN=''
+  C_MAGENTA=''
+  C_WHITE=''
+  C_BOLD=''
   C_RESET=''
 fi
 
 log() { printf "%s\n" "$*"; }
 say() { printf "%b%s%b\n" "$1" "$2" "$C_RESET"; }
-section() { printf "%b==> %s%b\n" "$C_CYAN" "$1" "$C_RESET"; }
-ok() { say "$C_GREEN" "[OK] $1"; }
-warn() { say "$C_YELLOW" "[!!] $1"; }
-err() { say "$C_RED" "[ERR] $1"; }
+section() { printf "\n%b▶ %s%b\n" "$C_CYAN$C_BOLD" "$1" "$C_RESET"; }
+ok() { say "$C_GREEN" " ✔  $1"; }
+warn() { say "$C_YELLOW" " ⚠  $1"; }
+err() { say "$C_RED" " ✖  $1"; }
 die() { printf "error: %s\n" "$*" >&2; exit 1; }
+
+print_banner() {
+  printf "\n%b" "$C_CYAN$C_BOLD"
+  cat <<"EOF"
+    ___                         _____urf 
+   /   |  ____  ____  ____     / ___/__  ___________ 
+  / /| | / __ \/ __ \/ __ \    \__ \/ / / / ___/ __ \
+ / ___ |/ / / / /_/ / / / /   ___/ / /_/ / /  / /_/ /
+/_/  |_/_/ /_/\____/_/ /_/   /____/\__,_/_/  / .___/ 
+      Lite Edition ⚡                           /_/     
+EOF
+  printf "%b\n" "$C_RESET"
+}
+
+spinner() {
+    local pid=$1
+    local delay=0.1
+    local spinstr='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+    while kill -0 "$pid" 2>/dev/null; do
+        local temp=${spinstr#?}
+        printf " [%c]  " "$spinstr"
+        local spinstr=$temp${spinstr%"$temp"}
+        sleep $delay
+        printf "\b\b\b\b\b\b"
+    done
+    printf "    \b\b\b\b"
+}
 
 has_tor_nat_rules() {
   nft list table inet anonsurf >/dev/null 2>&1
@@ -177,6 +210,14 @@ ensure_torrc() {
     printf "DNSPort %s\n" "$TOR_DNS_PORT"
     printf "ControlPort %s\n" "$TOR_CTRL_PORT"
     printf "CookieAuthentication 1\n"
+    
+    # Speed Optimizations
+    printf "UseEntryGuards 1\n"
+    printf "NumEntryGuards 2\n"
+    printf "CircuitBuildTimeout 10\n"
+    printf "LearnCircuitBuildTimeout 1\n"
+    printf "MaxCircuitDirtiness 600\n"
+
     if [ -n "$TOR_EXIT_NODES" ]; then
       printf "ExitNodes %s\n" "$TOR_EXIT_NODES"
       if [ "$TOR_STRICT_NODES" -eq 1 ]; then
@@ -332,36 +373,53 @@ wait_for_tor() {
   else
     die "missing ss/netstat; install iproute2 or net-tools before start"
   fi
-  for i in $(seq 1 10); do
-    if tor_is_active; then
-      if [ "$check_cmd" = "ss" ]; then
-        if ss -ltnu | grep -q ":${TOR_DNS_PORT} " && ss -ltn | grep -q ":${TOR_TRANS_PORT} "; then
-          return 0
-        fi
-      else
-        if netstat -ltnu | grep -q ":${TOR_DNS_PORT} " && netstat -ltn | grep -q ":${TOR_TRANS_PORT} "; then
-          return 0
+  
+  printf "%b ⟳  Building Tor circuits... %b" "$C_YELLOW" "$C_RESET"
+  
+  (
+    for i in $(seq 1 150); do
+      if tor_is_active; then
+        if [ "$check_cmd" = "ss" ]; then
+          if ss -ltnu | grep -q ":${TOR_DNS_PORT} " && ss -ltn | grep -q ":${TOR_TRANS_PORT} "; then
+            exit 0
+          fi
+        else
+          if netstat -ltnu | grep -q ":${TOR_DNS_PORT} " && netstat -ltn | grep -q ":${TOR_TRANS_PORT} "; then
+            exit 0
+          fi
         fi
       fi
-    fi
-    sleep 1
-  done
-  die "tor did not become ready (service: ${TOR_UNIT})"
+      sleep 0.1
+    done
+    exit 1
+  ) &
+  
+  local pid=$!
+  spinner $pid
+  wait $pid
+  local exit_code=$?
+  
+  if [ $exit_code -ne 0 ]; then
+    printf "\n"
+    die "tor did not become ready (service: ${TOR_UNIT})"
+  fi
+  printf "\r%b ✔  Tor circuits established!       %b\n" "$C_GREEN" "$C_RESET"
 }
 
 status() {
-  section "Status"
+  print_banner
+  section "System Service Status"
   detect_tor_unit
   if tor_is_active; then
-    ok "tor: active (${TOR_UNIT})"
+    ok "Tor Engine: Active (${TOR_UNIT})"
   else
-    warn "tor: inactive (${TOR_UNIT})"
+    warn "Tor Engine: Inactive (${TOR_UNIT})"
   fi
 
   if has_tor_nat_rules; then
-    ok "tor nftables rules: present"
+    ok "Transparent Proxy: Active (nftables)"
   else
-    warn "tor nftables rules: missing"
+    warn "Transparent Proxy: Inactive (nftables missing)"
   fi
 
   if command -v ss >/dev/null 2>&1; then
@@ -378,29 +436,51 @@ status() {
   fi
 
   if command -v curl >/dev/null 2>&1 && command -v torsocks >/dev/null 2>&1; then
-    local direct_ip tor_ip
-    direct_ip="$(curl -s --max-time 3 https://api.ipify.org || true)"
-    tor_ip="$(torsocks curl -s --max-time 6 https://api.ipify.org || true)"
-    if [ -n "$direct_ip" ]; then
-      ok "direct IP: ${direct_ip}"
-    else
-      warn "direct IP: unavailable"
+    section "Network Identity"
+    local direct_ip tor_ip geo_json geo_city geo_country geo_org
+    
+    printf "%b ⟳  Analyzing network streams... %b" "$C_CYAN" "$C_RESET"
+    
+    # Hide standard error to prevent UI breaking
+    direct_ip="$(curl -s --max-time 3 -4 https://api.ipify.org 2>/dev/null || true)"
+    tor_ip="$(torsocks curl -s --max-time 6 -4 https://api.ipify.org 2>/dev/null || true)"
+    geo_json="$(torsocks curl -s --max-time 6 -4 https://ipinfo.io/json 2>/dev/null || true)"
+    
+    printf "\r                                  \r"
+    
+    # Parse JSON poorly via grep/sed (avoids jq dependency)
+    geo_city="$(printf "%s" "$geo_json" | grep '"city"' | cut -d '"' -f 4 || true)"
+    geo_country="$(printf "%s" "$geo_json" | grep '"country"' | cut -d '"' -f 4 || true)"
+    geo_org="$(printf "%s" "$geo_json" | grep '"org"' | cut -d '"' -f 4 || true)"
+    
+    if [ -z "$geo_city" ] || [ -z "$geo_country" ]; then
+      geo_city="Unknown"
+      geo_country="Location"
     fi
-    if [ -n "$tor_ip" ]; then
-      ok "tor IP: ${tor_ip}"
-    else
-      warn "tor IP: unavailable"
+    if [ -z "$geo_org" ]; then
+      geo_org="Unknown ISP"
     fi
+
+    printf " ╭───────────────────────────────────────────────────╮\n"
+    printf " │ %b%-18s%b │ %-30s │\n" "$C_BOLD" "Real Interface" "$C_RESET" "${direct_ip:-Unavailable}"
+    printf " ├────────────────────┼────────────────────────────────┤\n"
+    printf " │ %b%-18s%b │ %b%-30s%b │\n" "$C_MAGENTA$C_BOLD" "Anonsurf Node" "$C_RESET" "$C_GREEN" "${tor_ip:-Unavailable}" "$C_RESET"
+    printf " │ %b%-18s%b │ %-30s │\n" "$C_BOLD" "Exit Location" "$C_RESET" "${geo_city}, ${geo_country}"
+    printf " │ %b%-18s%b │ %-30s │\n" "$C_BOLD" "Exit ISP" "$C_RESET" "$(printf "%.30s" "$geo_org")"
+    printf " ╰───────────────────────────────────────────────────╯\n"
+
     if [ -n "$direct_ip" ] && [ -n "$tor_ip" ]; then
       if [ "$direct_ip" = "$tor_ip" ]; then
-        warn "Tor not enforced (direct == Tor IP)"
+        err "SYSTEM COMPROMISED: Tor is not enforcing routing! (Direct IP = Tor IP)"
       else
         if has_tor_nat_rules; then
-          ok "system appears torified (nftables enforced)"
+          printf "\n%b [✔] SYSTEM IS SECURED AND TORIFIED %b\n\n" "$C_GREEN$C_BOLD" "$C_RESET"
         else
-          warn "Tor reachable via torsocks only (system not torified)"
+          warn "Tor is reachable but global system is NOT torified."
         fi
       fi
+    else
+      warn "Unable to fetch complete network identity."
     fi
   fi
 }
@@ -422,7 +502,8 @@ doctor() {
 
 start() {
   need_root
-  section "Starting ${APP_NAME}"
+  print_banner
+  section "Engaging Anonsurf..."
   preflight
   ensure_state_dir
   record_tor_state
@@ -455,7 +536,8 @@ start() {
 
 stop() {
   need_root
-  section "Stopping ${APP_NAME}"
+  print_banner
+  section "Disengaging Anonsurf..."
   restore_iptables
   restore_resolv_conf
   restore_torrc
